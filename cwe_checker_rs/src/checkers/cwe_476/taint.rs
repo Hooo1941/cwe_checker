@@ -1,4 +1,4 @@
-use crate::abstract_domain::{AbstractDomain, HasByteSize, HasTop, RegisterDomain};
+use crate::abstract_domain::{AbstractDomain, HasTop, RegisterDomain, SizedDomain};
 use crate::intermediate_representation::*;
 use crate::prelude::*;
 use std::fmt::Display;
@@ -45,12 +45,17 @@ impl AbstractDomain for Taint {
     }
 }
 
-impl HasByteSize for Taint {
+impl SizedDomain for Taint {
     /// The size in bytes of the `Taint` value.
     fn bytesize(&self) -> ByteSize {
         match self {
             Self::Tainted(size) | Self::Top(size) => *size,
         }
+    }
+
+    /// Get a new `Top`-value with the given bytesize.
+    fn new_top(bytesize: ByteSize) -> Self {
+        Self::Top(bytesize)
     }
 }
 
@@ -62,11 +67,6 @@ impl HasTop for Taint {
 }
 
 impl RegisterDomain for Taint {
-    /// Get a new `Top`-value with the given bytesize.
-    fn new_top(bytesize: ByteSize) -> Self {
-        Self::Top(bytesize)
-    }
-
     /// The result of a binary operation is tainted if at least one input value was tainted.
     fn bin_op(&self, op: BinOpType, rhs: &Self) -> Self {
         match (self, rhs) {

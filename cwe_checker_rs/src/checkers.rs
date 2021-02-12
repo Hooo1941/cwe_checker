@@ -1,4 +1,5 @@
 pub mod cwe_190;
+pub mod cwe_215;
 pub mod cwe_243;
 pub mod cwe_332;
 pub mod cwe_367;
@@ -7,4 +8,5 @@ pub mod cwe_467;
 pub mod cwe_476;
 pub mod cwe_560;
 pub mod cwe_676;
+pub mod cwe_78;
 pub mod cwe_782;

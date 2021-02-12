@@ -1,5 +1,5 @@
 use super::{
-    AbstractDomain, AbstractIdentifier, HasByteSize, HasTop, PointerDomain, RegisterDomain,
+    AbstractDomain, AbstractIdentifier, HasTop, PointerDomain, RegisterDomain, SizedDomain,
 };
 use crate::intermediate_representation::*;
 use crate::prelude::*;
@@ -62,7 +62,7 @@ impl<T: RegisterDomain> DataDomain<T> {
     }
 }
 
-impl<T: RegisterDomain> HasByteSize for DataDomain<T> {
+impl<T: RegisterDomain> SizedDomain for DataDomain<T> {
     // Return the bitsize of `self`.
     fn bytesize(&self) -> ByteSize {
         use DataDomain::*;
@@ -71,6 +71,11 @@ impl<T: RegisterDomain> HasByteSize for DataDomain<T> {
             Pointer(pointer) => pointer.bytesize(),
             Value(bitvec) => bitvec.bytesize(),
         }
+    }
+
+    // Return a new *Top* element with the given bytesize
+    fn new_top(bytesize: ByteSize) -> Self {
+        Self::Top(bytesize)
     }
 }
 
@@ -82,11 +87,6 @@ impl<T: RegisterDomain> HasTop for DataDomain<T> {
 }
 
 impl<T: RegisterDomain> RegisterDomain for DataDomain<T> {
-    // Return a new *Top* element with the given bytesize
-    fn new_top(bytesize: ByteSize) -> Self {
-        Self::Top(bytesize)
-    }
-
     /// Compute the (abstract) result of a binary operation
     fn bin_op(&self, op: BinOpType, rhs: &Self) -> Self {
         use BinOpType::*;

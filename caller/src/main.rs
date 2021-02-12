@@ -1,10 +1,13 @@
-use cwe_checker_rs::intermediate_representation::Project;
+use cwe_checker_rs::utils::binary::RuntimeMemoryImage;
 use cwe_checker_rs::utils::log::print_all_messages;
 use cwe_checker_rs::utils::{get_ghidra_plugin_path, read_config_file};
 use cwe_checker_rs::AnalysisResults;
+use cwe_checker_rs::{intermediate_representation::Project, utils::log::LogMessage};
+use nix::{sys::stat, unistd};
 use std::collections::HashSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::thread;
 use structopt::StructOpt;
 
 #[derive(Debug, StructOpt)]
@@ -33,10 +36,6 @@ struct CmdlineArgs {
     /// Do not print log messages. This prevents polluting STDOUT for json output.
     #[structopt(long, short)]
     quiet: bool,
-
-    /// Checks if there is a path from an input function to a CWE hit.
-    #[structopt(long)]
-    check_path: bool,
 
     /// Prints out the version numbers of all known modules.
     #[structopt(long)]
@@ -86,9 +85,6 @@ fn build_bap_command(args: &CmdlineArgs) -> Command {
     if args.quiet {
         command.arg("--cwe-checker-no-logging");
     }
-    if args.check_path {
-        command.arg("--cwe-checker-check-path");
-    }
     if args.module_versions {
         command.arg("--cwe-checker-module-versions");
     }
@@ -119,10 +115,6 @@ fn run_with_ghidra(args: CmdlineArgs) {
         return;
     }
 
-    if args.check_path {
-        panic!("Check-path module not yet implemented for the Ghidra backend");
-    }
-
     // Get the configuration file
     let config: serde_json::Value = if let Some(config_path) = args.config {
         let file = std::io::BufReader::new(std::fs::File::open(config_path).unwrap());
@@ -134,14 +126,40 @@ fn run_with_ghidra(args: CmdlineArgs) {
     // Filter the modules to be executed if the `--partial` parameter is set.
     if let Some(ref partial_module_list) = args.partial {
         filter_modules_for_partial_run(&mut modules, partial_module_list);
+    } else {
+        // TODO: CWE78 is disabled on a standard run for now,
+        // because it uses up huge amounts of RAM and computation time on some binaries.
+        modules = modules
+            .into_iter()
+            .filter(|module| module.name != "CWE78")
+            .collect();
     }
 
-    let mut project = get_project_from_ghidra(&Path::new(&args.binary.unwrap()));
+    let binary_file_path = PathBuf::from(args.binary.unwrap());
+    let binary: Vec<u8> = std::fs::read(&binary_file_path).unwrap_or_else(|_| {
+        panic!(
+            "Error: Could not read from file path {}",
+            binary_file_path.display()
+        )
+    });
+    let mut project = get_project_from_ghidra(&binary_file_path, &binary[..], args.quiet);
     // Normalize the project and gather log messages generated from it.
     let mut all_logs = project.normalize();
-    let mut analysis_results = AnalysisResults::new(&project);
 
-    let modules_depending_on_pointer_inference = vec!["CWE243", "CWE367", "CWE476", "Memory"];
+    // Generate the representation of the runtime memory image of the binary
+    let mut runtime_memory_image = RuntimeMemoryImage::new(&binary).unwrap_or_else(|err| {
+        panic!("Error while generating runtime memory image: {}", err);
+    });
+    if project.program.term.address_base_offset != 0 {
+        // We adjust the memory addresses once globally
+        // so that other analyses do not have to adjust their addresses.
+        runtime_memory_image.add_global_memory_offset(project.program.term.address_base_offset);
+    }
+
+    let mut analysis_results = AnalysisResults::new(&binary, &runtime_memory_image, &project);
+
+    let modules_depending_on_pointer_inference =
+        vec!["CWE78", "CWE243", "CWE367", "CWE476", "Memory"];
     let pointer_inference_results = if modules
         .iter()
         .any(|module| modules_depending_on_pointer_inference.contains(&module.name))
@@ -158,6 +176,7 @@ fn run_with_ghidra(args: CmdlineArgs) {
     if args.debug {
         cwe_checker_rs::analysis::pointer_inference::run(
             &project,
+            &runtime_memory_image,
             serde_json::from_value(config["Memory"].clone()).unwrap(),
             true,
         );
@@ -191,7 +210,7 @@ fn filter_modules_for_partial_run(
         .filter_map(|module_name| {
             if let Some(module) = modules.iter().find(|module| module.name == module_name) {
                 Some(*module)
-            } else if module_name == "" {
+            } else if module_name.is_empty() {
                 None
             } else {
                 panic!("Error: {} is not a valid module name.", module_name)
@@ -201,7 +220,7 @@ fn filter_modules_for_partial_run(
 }
 
 /// Execute the `p_code_extractor` plugin in ghidra and parse its output into the `Project` data structure.
-fn get_project_from_ghidra(file_path: &Path) -> Project {
+fn get_project_from_ghidra(file_path: &Path, binary: &[u8], quiet_flag: bool) -> Project {
     let ghidra_path: std::path::PathBuf =
         serde_json::from_value(read_config_file("ghidra.json")["ghidra_path"].clone())
             .expect("Path to Ghidra not configured.");
@@ -231,44 +250,89 @@ fn get_project_from_ghidra(file_path: &Path) -> Project {
     let filename = file_path
         .file_name()
         .expect("Invalid file name")
-        .to_string_lossy();
-    let output_filename = format!("{}_{}.json", filename, timestamp_suffix);
-    let output_path = tmp_folder.join(output_filename);
+        .to_string_lossy()
+        .to_string();
     let ghidra_plugin_path = get_ghidra_plugin_path("p_code_extractor");
-    // Execute Ghidra
-    let output = Command::new(&headless_path)
-        .arg(&tmp_folder) // The folder where temporary files should be stored
-        .arg(format!("PcodeExtractor_{}_{}", filename, timestamp_suffix)) // The name of the temporary Ghidra Project.
-        .arg("-import") // Import a file into the Ghidra project
-        .arg(file_path) // File import path
-        .arg("-postScript") // Execute a script after standard analysis by Ghidra finished
-        .arg(ghidra_plugin_path.join("PcodeExtractor.java")) // Path to the PcodeExtractor.java
-        .arg(&output_path) // Output file path
-        .arg("-scriptPath") // Add a folder containing additional script files to the Ghidra script file search paths
-        .arg(ghidra_plugin_path) // Path to the folder containing the PcodeExtractor.java (so that the other java files can be found.)
-        .arg("-deleteProject") // Delete the temporary project after the script finished
-        .arg("-analysisTimeoutPerFile") // Set a timeout for how long the standard analysis can run before getting aborted
-        .arg("3600") // Timeout of one hour (=3600 seconds) // TODO: The post-script can detect that the timeout fired and react accordingly.
-        .output() // Execute the command and catch its output.
-        .unwrap();
-    if !output.status.success() {
-        match output.status.code() {
-            Some(code) => {
-                println!("{}", String::from_utf8(output.stdout).unwrap());
-                println!("{}", String::from_utf8(output.stderr).unwrap());
-                panic!("Execution of Ghidra plugin failed with exit code {}", code)
-            }
-            None => panic!("Execution of Ghidra plugin failed: Process was terminated."),
-        }
+
+    // Create a unique name for the pipe
+    let fifo_path = tmp_folder.join(format!("pcode_{}.pipe", timestamp_suffix));
+
+    // Create a new fifo and give read and write rights to the owner
+    if let Err(err) = unistd::mkfifo(&fifo_path, stat::Mode::from_bits(0o600).unwrap()) {
+        eprintln!("Error creating FIFO pipe: {}", err);
+        std::process::exit(101);
     }
-    // Read the results from the Ghidra script
-    let file =
-        std::fs::File::open(&output_path).expect("Could not read results of the Ghidra script");
+
+    let thread_fifo_path = fifo_path.clone();
+    let thread_file_path = file_path.to_path_buf();
+    let thread_tmp_folder = tmp_folder.to_path_buf();
+    // Execute Ghidra in a new thread and return a Join Handle, so that the thread is only joined
+    // after the output has been read into the cwe_checker
+    let ghidra_subprocess = thread::spawn(move || {
+        let output = match Command::new(&headless_path)
+            .arg(&thread_tmp_folder) // The folder where temporary files should be stored
+            .arg(format!("PcodeExtractor_{}_{}", filename, timestamp_suffix)) // The name of the temporary Ghidra Project.
+            .arg("-import") // Import a file into the Ghidra project
+            .arg(thread_file_path) // File import path
+            .arg("-postScript") // Execute a script after standard analysis by Ghidra finished
+            .arg(ghidra_plugin_path.join("PcodeExtractor.java")) // Path to the PcodeExtractor.java
+            .arg(thread_fifo_path) // The path to the named pipe (fifo)
+            .arg("-scriptPath") // Add a folder containing additional script files to the Ghidra script file search paths
+            .arg(ghidra_plugin_path) // Path to the folder containing the PcodeExtractor.java (so that the other java files can be found.)
+            .arg("-deleteProject") // Delete the temporary project after the script finished
+            .arg("-analysisTimeoutPerFile") // Set a timeout for how long the standard analysis can run before getting aborted
+            .arg("3600") // Timeout of one hour (=3600 seconds) // TODO: The post-script can detect that the timeout fired and react accordingly.
+            .output() // Execute the command and catch its output.
+        {
+            Ok(output) => output,
+            Err(err) => {
+                eprintln!("Error: Ghidra could not be executed:\n{}", err);
+                std::process::exit(101);
+            }
+        };
+
+        if !output.status.success() {
+            match output.status.code() {
+                Some(code) => {
+                    eprintln!("{}", String::from_utf8(output.stdout).unwrap());
+                    eprintln!("{}", String::from_utf8(output.stderr).unwrap());
+                    eprintln!("Execution of Ghidra plugin failed with exit code {}", code);
+                    std::process::exit(101);
+                }
+                None => {
+                    eprintln!("Execution of Ghidra plugin failed: Process was terminated.");
+                    std::process::exit(101);
+                }
+            }
+        }
+    });
+
+    // Open the FIFO
+    let file = std::fs::File::open(fifo_path.clone()).expect("Could not open FIFO.");
+
     let mut project_pcode: cwe_checker_rs::pcode::Project =
         serde_json::from_reader(std::io::BufReader::new(file)).unwrap();
     project_pcode.normalize();
-    let project: Project = project_pcode.into();
-    // delete the temporary file again.
-    std::fs::remove_file(output_path).unwrap();
+    let project: Project = match cwe_checker_rs::utils::get_binary_base_address(binary) {
+        Ok(binary_base_address) => project_pcode.into_ir_project(binary_base_address),
+        Err(_err) => {
+            if !quiet_flag {
+                let log = LogMessage::new_info("Could not determine binary base address. Using base address of Ghidra output as fallback.");
+                println!("{}", log);
+            }
+            let mut project = project_pcode.into_ir_project(0);
+            // Setting the address_base_offset to zero is a hack, which worked for the tested PE files.
+            // But this hack will probably not work in general!
+            project.program.term.address_base_offset = 0;
+            project
+        }
+    };
+
+    ghidra_subprocess
+        .join()
+        .expect("The Ghidra thread to be joined has panicked!");
+
+    std::fs::remove_file(fifo_path).unwrap();
+
     project
 }

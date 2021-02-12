@@ -13,12 +13,17 @@
 //!
 //! See the `Config` struct for configurable analysis parameters.
 
-use super::interprocedural_fixpoint::{Computation, NodeValue};
-use crate::abstract_domain::{BitvectorDomain, DataDomain};
+use super::fixpoint::Computation;
+use super::forward_interprocedural_fixpoint::GeneralizedContext;
+use super::interprocedural_fixpoint_generic::NodeValue;
 use crate::analysis::graph::{Graph, Node};
 use crate::intermediate_representation::*;
 use crate::prelude::*;
 use crate::utils::log::*;
+use crate::{
+    abstract_domain::{BitvectorDomain, DataDomain},
+    utils::binary::RuntimeMemoryImage,
+};
 use petgraph::graph::NodeIndex;
 use petgraph::visit::IntoNodeReferences;
 use petgraph::Direction;
@@ -59,7 +64,7 @@ pub struct Config {
 
 /// A wrapper struct for the pointer inference computation object.
 pub struct PointerInference<'a> {
-    computation: Computation<'a, Context<'a>>,
+    computation: Computation<GeneralizedContext<'a, Context<'a>>>,
     log_collector: crossbeam_channel::Sender<LogThreadMsg>,
     pub collected_logs: (Vec<LogMessage>, Vec<CweWarning>),
 }
@@ -68,10 +73,11 @@ impl<'a> PointerInference<'a> {
     /// Generate a new pointer inference compuation for a project.
     pub fn new(
         project: &'a Project,
+        runtime_memory_image: &'a RuntimeMemoryImage,
         config: Config,
         log_sender: crossbeam_channel::Sender<LogThreadMsg>,
     ) -> PointerInference<'a> {
-        let context = Context::new(project, config, log_sender.clone());
+        let context = Context::new(project, runtime_memory_image, config, log_sender.clone());
 
         let mut entry_sub_to_entry_blocks_map = HashMap::new();
         let subs: HashMap<Tid, &Term<Sub>> = project
@@ -107,7 +113,7 @@ impl<'a> PointerInference<'a> {
             })
             .collect();
         let mut fixpoint_computation =
-            super::interprocedural_fixpoint::Computation::new(context, None);
+            super::forward_interprocedural_fixpoint::create_computation(context, None);
         let _ = log_sender.send(LogThreadMsg::Log(LogMessage::new_debug(format!(
             "Pointer Inference: Adding {} entry points",
             entry_sub_to_entry_node_map.len()
@@ -115,7 +121,7 @@ impl<'a> PointerInference<'a> {
         for (sub_tid, start_node_index) in entry_sub_to_entry_node_map.into_iter() {
             fixpoint_computation.set_node_value(
                 start_node_index,
-                super::interprocedural_fixpoint::NodeValue::Value(State::new(
+                super::interprocedural_fixpoint_generic::NodeValue::Value(State::new(
                     &project.stack_pointer_register,
                     sub_tid,
                 )),
@@ -175,7 +181,7 @@ impl<'a> PointerInference<'a> {
     }
 
     pub fn get_context(&self) -> &Context {
-        self.computation.get_context()
+        self.computation.get_context().get_context()
     }
 
     pub fn get_node_value(&self, node_id: NodeIndex) -> Option<&NodeValue<State>> {
@@ -235,7 +241,7 @@ impl<'a> PointerInference<'a> {
                 .clone();
             self.computation.set_node_value(
                 entry,
-                super::interprocedural_fixpoint::NodeValue::Value(State::new(
+                super::interprocedural_fixpoint_generic::NodeValue::Value(State::new(
                     &project.stack_pointer_register,
                     sub_tid,
                 )),
@@ -363,9 +369,10 @@ impl<'a> PointerInference<'a> {
                         }
                         Node::CallReturn { call, return_ } => {
                             let (call_state, return_state) = match node_value {
-                                NodeValue::CallReturnCombinator { call, return_ } => {
-                                    (call.is_some(), return_.is_some())
-                                }
+                                NodeValue::CallFlowCombinator {
+                                    call_stub,
+                                    interprocedural_flow,
+                                } => (call_stub.is_some(), interprocedural_flow.is_some()),
                                 _ => panic!(),
                             };
                             println!(
@@ -395,10 +402,20 @@ pub fn extract_pi_analysis_results(
 ///
 /// If `print_debug` is set to `true` print debug information to *stdout*.
 /// Note that the format of the debug information is currently unstable and subject to change.
-pub fn run(project: &Project, config: Config, print_debug: bool) -> PointerInference {
+pub fn run<'a>(
+    project: &'a Project,
+    runtime_memory_image: &'a RuntimeMemoryImage,
+    config: Config,
+    print_debug: bool,
+) -> PointerInference<'a> {
     let logging_thread = LogThread::spawn(collect_all_logs);
 
-    let mut computation = PointerInference::new(project, config, logging_thread.get_msg_sender());
+    let mut computation = PointerInference::new(
+        project,
+        runtime_memory_image,
+        config,
+        logging_thread.get_msg_sender(),
+    );
 
     computation.compute_with_speculative_entry_points(project);
 
@@ -454,13 +471,16 @@ mod tests {
     use super::*;
 
     impl<'a> PointerInference<'a> {
-        pub fn mock(project: &'a Project) -> PointerInference<'a> {
+        pub fn mock(
+            project: &'a Project,
+            mem_image: &'a RuntimeMemoryImage,
+        ) -> PointerInference<'a> {
             let config = Config {
                 allocation_symbols: vec!["malloc".to_string()],
                 deallocation_symbols: vec!["free".to_string()],
             };
             let (log_sender, _) = crossbeam_channel::unbounded();
-            PointerInference::new(project, config, log_sender)
+            PointerInference::new(project, mem_image, config, log_sender)
         }
     }
 }
