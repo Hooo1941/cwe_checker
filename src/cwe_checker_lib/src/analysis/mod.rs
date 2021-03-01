@@ -1,3 +1,4 @@
+pub mod abstract_string;
 pub mod backward_interprocedural_fixpoint;
 pub mod fixpoint;
 pub mod forward_interprocedural_fixpoint;
