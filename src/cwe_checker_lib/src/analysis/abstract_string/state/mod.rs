@@ -1,22 +1,12 @@
-use std::collections::BTreeMap;
+use std::collections::HashMap;
 
 use super::*;
-use crate::{
-    abstract_domain::{AbstractDomain, HasTop},
-    intermediate_representation::Variable,
-    prelude::*,
-};
+use crate::{abstract_domain::{AbstractDomain, AbstractIdentifier, HasTop}, prelude::*};
 
 /// Contains all information known about the state of a program at a specific point of time.
 #[derive(Serialize, Deserialize, Debug, PartialEq, Eq, Clone)]
 pub struct State<T: AbstractDomain + HasTop> {
-    /// Maps a register variable to an abstract string domain value.
-    /// All registers not contained, do not hold a string value.
-    /// This represents the rare cases where a string constant is directly
-    /// put into the register.
-    register: BTreeMap<Variable, T>,
-    /// Maps a pointer plus offset to an abstract string domain value in memory.
-    pointer: BTreeMap<(Variable, i64), T>,
+    known_strings: HashMap<AbstractIdentifier, T>,
 }
 
 impl<T: AbstractDomain + HasTop> AbstractDomain for State<T> {
@@ -32,8 +22,7 @@ impl<T: AbstractDomain + HasTop> AbstractDomain for State<T> {
 impl<T: AbstractDomain + HasTop> State<T> {
     pub fn new() -> State<T> {
         State {
-            register: BTreeMap::new(),
-            pointer: BTreeMap::new(),
+            known_strings: HashMap::new(),
         }
     }
 }
